@@ -1,3 +1,5 @@
+data/
+
 # Secrets and local config
 .env
 .env.*
