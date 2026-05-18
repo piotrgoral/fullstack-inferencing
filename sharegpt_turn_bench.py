@@ -55,6 +55,11 @@ async def _send_turn_request(
         "stream": stream,
         "max_tokens": max_tokens,
     }
+    if stream:
+        # Ask the upstream to include usage in the streaming SSE so the gateway
+        # can parse prompt/completion token counts into gateway_metrics_*.jsonl.
+        payload.setdefault("stream_options", {})
+        payload["stream_options"]["include_usage"] = True
     headers = {
         "X-Technique": technique,
         "X-Conversation-Id": str(conversation_id),
