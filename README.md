@@ -312,6 +312,37 @@ With Grafana open (time range **Last 1 hour** or **Last 15 minutes**):
 
 ---
 
+### Step 18b — Optional: ShareGPT turn-by-turn benchmark
+
+With vLLM, the gateway, nginx, Prometheus, and Grafana running (Steps **6–17**), you can drive a multi-turn benchmark using real ShareGPT conversations:
+
+1. From the repo root, run:
+
+   ```bash
+   cd fullstack-inferencing
+   set -a && source .env && set +a
+   python sharegpt_turn_bench.py \
+     --technique baseline \
+     --num-conversations 20 \
+     --mode static \
+     --sleep-between-turns 0.3
+   ```
+
+   - On the first run this downloads the ShareGPT JSON (~hundreds of MB) into `~/.cache/llm_bench/sharegpt.json` (configurable via `SHAREGPT_CACHE_DIR` or `--dataset-path`).
+   - Each **user turn** in a conversation is sent as a separate `POST /v1/chat/completions` request through the gateway with `X-Technique: baseline`.
+
+2. Watch Grafana panels (TinyLlama dashboards) as the conversation progresses:
+
+   - Each turn appears as another request in the gateway histograms and counters (`llm_gateway_*` metrics).
+   - Over time you can see how TTFT, total latency, tokens/s, and cost behave across turns for the same technique / server profile.
+
+3. For offline analysis:
+
+   - The gateway writes one JSONL row per request under `logs/gateway/`.
+   - When you use `sharegpt_turn_bench.py`, each row also includes `conversation_id` and `conversation_turn` fields derived from the request headers.
+
+---
+
 ### Step 19 — Different vLLM engine settings (A/B)
 
 Engine flags are documented in [vLLM engine arguments](https://docs.vllm.ai/en/stable/configuration/engine_args/). **`crew.py --technique`** sets **`X-Technique`**; with **`VLLM_AUTO_ENGINE_ROUTING=1`** the gateway maps **`baseline`**, **`chunked_prefill`**, **`prefix_caching`**, **`chunked_prefill_and_prefix_caching`**, **`baseline_strict`**, **`speculative_decoding`**, and **`beam_search`** (same upstream as baseline) to **ports** **8000–8005** derived from **`VLLM_BASE_URL`** (see Step 6 / **`.env.example`**). Run the fleet on the GPU host, multi-port tunnel on the laptop, then e.g. **`python crew.py --technique chunked_prefill`**.

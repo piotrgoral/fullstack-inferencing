@@ -461,9 +461,11 @@ def _build_metrics_log_row(
     inter_chunk_delays_s: list[float],
     prompt_tokens: int,
     completion_tokens: int,
+    conversation_id: str | None = None,
+    conversation_turn: str | None = None,
 ) -> dict[str, Any]:
     inter_ms = [d * 1000.0 for d in inter_chunk_delays_s]
-    return {
+    row: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "technique": technique,
         "server_profile": VLLM_SERVER_PROFILE,
@@ -488,6 +490,11 @@ def _build_metrics_log_row(
             completion_tokens=completion_tokens,
         ),
     }
+    if conversation_id is not None:
+        row["conversation_id"] = conversation_id
+    if conversation_turn is not None:
+        row["conversation_turn"] = conversation_turn
+    return row
 
 
 async def _append_gateway_metrics_log(app: FastAPI, row: dict[str, Any]) -> None:
@@ -848,6 +855,8 @@ async def _proxy(request: Request, upstream_path: str) -> Response:
                 REQUEST_DURATION.labels(**lp).observe(dt)
                 REQUEST_COST_USD.labels(**lp).inc(_estimate_cost_usd(dt, gw_app))
                 REQUESTS_TOTAL.labels(**lp).inc()
+                conv_id = request.headers.get("x-conversation-id")
+                conv_turn = request.headers.get("x-conversation-turn")
                 await _append_gateway_metrics_log(
                     gw_app,
                     _build_metrics_log_row(
@@ -862,6 +871,8 @@ async def _proxy(request: Request, upstream_path: str) -> Response:
                         inter_chunk_delays_s=inter,
                         prompt_tokens=pt,
                         completion_tokens=ct,
+                        conversation_id=conv_id,
+                        conversation_turn=conv_turn,
                     ),
                 )
                 span.end()
@@ -926,6 +937,8 @@ async def _proxy(request: Request, upstream_path: str) -> Response:
         _observe_tpot_and_tok_s(lp, tpot_s=tpot_avg_s, e2e_s=dt, completion_tokens=ct)
 
         tid = format(span.get_span_context().trace_id, "032x")
+        conv_id = request.headers.get("x-conversation-id")
+        conv_turn = request.headers.get("x-conversation-turn")
         await _append_gateway_metrics_log(
             request.app,
             _build_metrics_log_row(
@@ -940,6 +953,8 @@ async def _proxy(request: Request, upstream_path: str) -> Response:
                 inter_chunk_delays_s=[],
                 prompt_tokens=pt,
                 completion_tokens=ct,
+                conversation_id=conv_id,
+                conversation_turn=conv_turn,
             ),
         )
         if resp.status_code >= 400:
