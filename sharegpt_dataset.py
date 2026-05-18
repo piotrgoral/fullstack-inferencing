@@ -70,9 +70,6 @@ def load_sharegpt(
     with dataset_path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    random.seed(seed)
-    random.shuffle(raw)
-
     pool: list[dict[str, Any]] = []
 
     for entry in raw:
@@ -119,7 +116,7 @@ def load_sharegpt(
         return []
 
     if len(pool) > num_conversations:
-        pool = random.sample(pool, num_conversations)
+        pool = pool[:num_conversations]
 
     print(
         f"Loaded {len(pool)} ShareGPT conversations "
