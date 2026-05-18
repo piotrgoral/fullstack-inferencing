@@ -1,8 +1,8 @@
 """
 python scripts/export_experiments.py \
   --log-path logs/gateway/gateway_metrics_2026-05-18.jsonl \
-  --technique q35_4b_base-2 \
-  --output-csv data/experiments_q35_4b_base-2.csv
+  --technique q35_4b_base-conv-num-conv-64-max-turns-16-max-sessions-16-max-tokens-1024 \
+  --output-csv data/experiments_q35_4b_base-conv-num-conv-64-max-turns-16-max-sessions-16-max-tokens-1024.csv
 """
 
 from __future__ import annotations
@@ -478,6 +478,33 @@ def export_experiments(
         )
         max_kv_cache_usage_perc = kv_values[0][1] if kv_values else 0.0
 
+        # Prefix cache usage and hit rate over the run window.
+        prefix_hits_expr = (
+            f"sum(increase(vllm:prefix_cache_hits[{window_spec}]))"
+        )
+        prefix_queries_expr = (
+            f"sum(increase(vllm:prefix_cache_queries[{window_spec}]))"
+        )
+        prefix_hits_vals = prom_query_instant(
+            prometheus_url,
+            prefix_hits_expr,
+            end_ts,
+        )
+        prefix_queries_vals = prom_query_instant(
+            prometheus_url,
+            prefix_queries_expr,
+            end_ts,
+        )
+        vllm_prefix_cache_hits = prefix_hits_vals[0][1] if prefix_hits_vals else 0.0
+        vllm_prefix_cache_queries = (
+            prefix_queries_vals[0][1] if prefix_queries_vals else 0.0
+        )
+        vllm_prefix_cache_hit_rate = (
+            vllm_prefix_cache_hits / vllm_prefix_cache_queries
+            if vllm_prefix_cache_queries > 0
+            else None
+        )
+
         # Prefill and inter-token latency histograms over a short window (10s):
         # p50 ~ avg, p99 ~ max.
         prefill_avg_expr = (
@@ -529,6 +556,214 @@ def export_experiments(
         max_vllm_inter_token_latency_s = (
             inter_max_vals[0][1] if inter_max_vals else 0.0
         )
+
+        # Request queue length statistics over the run window.
+        waiting_min_expr = (
+            f"min_over_time(vllm:num_requests_waiting[{window_spec}])"
+        )
+        waiting_max_expr = (
+            f"max_over_time(vllm:num_requests_waiting[{window_spec}])"
+        )
+        waiting_avg_expr = (
+            f"avg_over_time(vllm:num_requests_waiting[{window_spec}])"
+        )
+        waiting_min_vals = prom_query_instant(
+            prometheus_url,
+            waiting_min_expr,
+            end_ts,
+        )
+        waiting_max_vals = prom_query_instant(
+            prometheus_url,
+            waiting_max_expr,
+            end_ts,
+        )
+        waiting_avg_vals = prom_query_instant(
+            prometheus_url,
+            waiting_avg_expr,
+            end_ts,
+        )
+        vllm_num_requests_waiting_min = (
+            waiting_min_vals[0][1] if waiting_min_vals else 0.0
+        )
+        vllm_num_requests_waiting_max = (
+            waiting_max_vals[0][1] if waiting_max_vals else 0.0
+        )
+        vllm_num_requests_waiting_avg = (
+            waiting_avg_vals[0][1] if waiting_avg_vals else 0.0
+        )
+
+        # Request queue time histogram percentiles (min/avg/max proxy).
+        queue_time_quantiles = {
+            "vllm_request_queue_time_seconds_min": 0.01,
+            "vllm_request_queue_time_seconds_avg": 0.50,
+            "vllm_request_queue_time_seconds_max": 0.99,
+        }
+        queue_time_metrics: Dict[str, float | None] = {}
+        for key, q in queue_time_quantiles.items():
+            queue_expr = (
+                f"histogram_quantile({q}, "
+                "sum by (le) ("
+                "rate(vllm:request_queue_time_seconds_bucket[5m])))"
+            )
+            vals = prom_query_instant(
+                prometheus_url,
+                queue_expr,
+                end_ts,
+            )
+            queue_time_metrics[key] = vals[0][1] if vals else None
+
+        # Number of running requests statistics over the run window.
+        running_min_expr = (
+            f"min_over_time(vllm:num_requests_running[{window_spec}])"
+        )
+        running_max_expr = (
+            f"max_over_time(vllm:num_requests_running[{window_spec}])"
+        )
+        running_avg_expr = (
+            f"avg_over_time(vllm:num_requests_running[{window_spec}])"
+        )
+        running_min_vals = prom_query_instant(
+            prometheus_url,
+            running_min_expr,
+            end_ts,
+        )
+        running_max_vals = prom_query_instant(
+            prometheus_url,
+            running_max_expr,
+            end_ts,
+        )
+        running_avg_vals = prom_query_instant(
+            prometheus_url,
+            running_avg_expr,
+            end_ts,
+        )
+        vllm_num_requests_running_min = (
+            running_min_vals[0][1] if running_min_vals else 0.0
+        )
+        vllm_num_requests_running_max = (
+            running_max_vals[0][1] if running_max_vals else 0.0
+        )
+        vllm_num_requests_running_avg = (
+            running_avg_vals[0][1] if running_avg_vals else 0.0
+        )
+
+        # Waiting requests broken down by reason (capacity vs deferred).
+        waiting_by_reason_expr = (
+            f"avg_over_time(vllm:num_requests_waiting_by_reason[{window_spec}])"
+        )
+        waiting_by_reason_vals = prom_query_instant(
+            prometheus_url,
+            waiting_by_reason_expr,
+            end_ts,
+        )
+        vllm_num_requests_waiting_capacity_avg = 0.0
+        vllm_num_requests_waiting_deferred_avg = 0.0
+        for metric, val in waiting_by_reason_vals:
+            reason = metric.get("reason")
+            if reason == "capacity":
+                vllm_num_requests_waiting_capacity_avg = val
+            elif reason == "deferred":
+                vllm_num_requests_waiting_deferred_avg = val
+
+        # vLLM E2E request latency percentiles.
+        e2e_latency_quantiles = {
+            "vllm_e2e_request_latency_seconds_p50": 0.50,
+            "vllm_e2e_request_latency_seconds_p95": 0.95,
+            "vllm_e2e_request_latency_seconds_p99": 0.99,
+        }
+        e2e_latency_metrics: Dict[str, float | None] = {}
+        for key, q in e2e_latency_quantiles.items():
+            e2e_expr = (
+                f"histogram_quantile({q}, "
+                "sum by (le) ("
+                "rate(vllm:e2e_request_latency_seconds_bucket[5m])))"
+            )
+            vals = prom_query_instant(
+                prometheus_url,
+                e2e_expr,
+                end_ts,
+            )
+            e2e_latency_metrics[key] = vals[0][1] if vals else None
+
+        # Request-shape metrics (max generation tokens, max_tokens param, n param).
+        request_shape_quantiles = {
+            "vllm_request_max_num_generation_tokens_p50": (
+                "vllm:request_max_num_generation_tokens_bucket",
+                0.50,
+            ),
+            "vllm_request_max_num_generation_tokens_p95": (
+                "vllm:request_max_num_generation_tokens_bucket",
+                0.95,
+            ),
+            "vllm_request_params_max_tokens_p50": (
+                "vllm:request_params_max_tokens_bucket",
+                0.50,
+            ),
+            "vllm_request_params_max_tokens_p95": (
+                "vllm:request_params_max_tokens_bucket",
+                0.95,
+            ),
+            "vllm_request_params_n_p50": (
+                "vllm:request_params_n_bucket",
+                0.50,
+            ),
+            "vllm_request_params_n_p95": (
+                "vllm:request_params_n_bucket",
+                0.95,
+            ),
+        }
+        request_shape_metrics: Dict[str, float | None] = {}
+        for key, (metric_name, q) in request_shape_quantiles.items():
+            shape_expr = (
+                f"histogram_quantile({q}, "
+                f"sum by (le) (rate({metric_name}[5m])))"
+            )
+            vals = prom_query_instant(
+                prometheus_url,
+                shape_expr,
+                end_ts,
+            )
+            request_shape_metrics[key] = vals[0][1] if vals else None
+
+        # KV-cache behavior metrics (idle before evict, lifetime, reuse gap).
+        kv_hist_quantiles = {
+            "vllm_kv_block_idle_before_evict_seconds_p50": (
+                "vllm:kv_block_idle_before_evict_seconds_bucket",
+                0.50,
+            ),
+            "vllm_kv_block_idle_before_evict_seconds_p95": (
+                "vllm:kv_block_idle_before_evict_seconds_bucket",
+                0.95,
+            ),
+            "vllm_kv_block_lifetime_seconds_p50": (
+                "vllm:kv_block_lifetime_seconds_bucket",
+                0.50,
+            ),
+            "vllm_kv_block_lifetime_seconds_p95": (
+                "vllm:kv_block_lifetime_seconds_bucket",
+                0.95,
+            ),
+            "vllm_kv_block_reuse_gap_seconds_p50": (
+                "vllm:kv_block_reuse_gap_seconds_bucket",
+                0.50,
+            ),
+            "vllm_kv_block_reuse_gap_seconds_p95": (
+                "vllm:kv_block_reuse_gap_seconds_bucket",
+                0.95,
+            ),
+        }
+        kv_hist_metrics: Dict[str, float | None] = {}
+        for key, (metric_name, q) in kv_hist_quantiles.items():
+            kv_expr_hist = (
+                f"histogram_quantile({q}, "
+                f"sum by (le) (rate({metric_name}[5m])))"
+            )
+            vals = prom_query_instant(
+                prometheus_url,
+                kv_expr_hist,
+                end_ts,
+            )
+            kv_hist_metrics[key] = vals[0][1] if vals else None
 
         # Time to first token latency histogram percentiles.
         tftt_p50_expr = (
@@ -626,6 +861,9 @@ def export_experiments(
             # vLLM engine metrics (vllm:*) aggregated over the window:
             "vllm_kv_cache_usage_perc_avg": avg_kv_cache_usage_perc,
             "vllm_kv_cache_usage_perc_max": max_kv_cache_usage_perc,
+            "vllm_prefix_cache_hits": vllm_prefix_cache_hits,
+            "vllm_prefix_cache_queries": vllm_prefix_cache_queries,
+            "vllm_prefix_cache_hit_rate": vllm_prefix_cache_hit_rate,
             "vllm_request_prefill_time_seconds_p50": avg_vllm_request_prefill_time_s,
             "vllm_request_prefill_time_seconds_p99": max_vllm_request_prefill_time_s,
             "vllm_inter_token_latency_seconds_p50": avg_vllm_inter_token_latency_s,
@@ -634,6 +872,68 @@ def export_experiments(
             "vllm_time_to_first_token_seconds_p95": vllm_time_to_first_token_seconds_p95,
             "vllm_time_to_first_token_seconds_p99": vllm_time_to_first_token_seconds_p99,
             "vllm_generation_tokens_total_rate_per_s": total_vllm_generation_tokens,
+            "vllm_num_requests_waiting_min": vllm_num_requests_waiting_min,
+            "vllm_num_requests_waiting_max": vllm_num_requests_waiting_max,
+            "vllm_num_requests_waiting_avg": vllm_num_requests_waiting_avg,
+            "vllm_num_requests_running_min": vllm_num_requests_running_min,
+            "vllm_num_requests_running_max": vllm_num_requests_running_max,
+            "vllm_num_requests_running_avg": vllm_num_requests_running_avg,
+            "vllm_num_requests_waiting_capacity_avg": vllm_num_requests_waiting_capacity_avg,
+            "vllm_num_requests_waiting_deferred_avg": vllm_num_requests_waiting_deferred_avg,
+            "vllm_request_queue_time_seconds_min": queue_time_metrics.get(
+                "vllm_request_queue_time_seconds_min"
+            ),
+            "vllm_request_queue_time_seconds_avg": queue_time_metrics.get(
+                "vllm_request_queue_time_seconds_avg"
+            ),
+            "vllm_request_queue_time_seconds_max": queue_time_metrics.get(
+                "vllm_request_queue_time_seconds_max"
+            ),
+            "vllm_e2e_request_latency_seconds_p50": e2e_latency_metrics.get(
+                "vllm_e2e_request_latency_seconds_p50"
+            ),
+            "vllm_e2e_request_latency_seconds_p95": e2e_latency_metrics.get(
+                "vllm_e2e_request_latency_seconds_p95"
+            ),
+            "vllm_e2e_request_latency_seconds_p99": e2e_latency_metrics.get(
+                "vllm_e2e_request_latency_seconds_p99"
+            ),
+            "vllm_request_max_num_generation_tokens_p50": request_shape_metrics.get(
+                "vllm_request_max_num_generation_tokens_p50"
+            ),
+            "vllm_request_max_num_generation_tokens_p95": request_shape_metrics.get(
+                "vllm_request_max_num_generation_tokens_p95"
+            ),
+            "vllm_request_params_max_tokens_p50": request_shape_metrics.get(
+                "vllm_request_params_max_tokens_p50"
+            ),
+            "vllm_request_params_max_tokens_p95": request_shape_metrics.get(
+                "vllm_request_params_max_tokens_p95"
+            ),
+            "vllm_request_params_n_p50": request_shape_metrics.get(
+                "vllm_request_params_n_p50"
+            ),
+            "vllm_request_params_n_p95": request_shape_metrics.get(
+                "vllm_request_params_n_p95"
+            ),
+            "vllm_kv_block_idle_before_evict_seconds_p50": kv_hist_metrics.get(
+                "vllm_kv_block_idle_before_evict_seconds_p50"
+            ),
+            "vllm_kv_block_idle_before_evict_seconds_p95": kv_hist_metrics.get(
+                "vllm_kv_block_idle_before_evict_seconds_p95"
+            ),
+            "vllm_kv_block_lifetime_seconds_p50": kv_hist_metrics.get(
+                "vllm_kv_block_lifetime_seconds_p50"
+            ),
+            "vllm_kv_block_lifetime_seconds_p95": kv_hist_metrics.get(
+                "vllm_kv_block_lifetime_seconds_p95"
+            ),
+            "vllm_kv_block_reuse_gap_seconds_p50": kv_hist_metrics.get(
+                "vllm_kv_block_reuse_gap_seconds_p50"
+            ),
+            "vllm_kv_block_reuse_gap_seconds_p95": kv_hist_metrics.get(
+                "vllm_kv_block_reuse_gap_seconds_p95"
+            ),
         }
         row.update(latency_metrics)
         rows.append(row)
@@ -669,6 +969,9 @@ def export_experiments(
         # vLLM (vllm:*) metrics:
         "vllm_kv_cache_usage_perc_avg",
         "vllm_kv_cache_usage_perc_max",
+        "vllm_prefix_cache_hits",
+        "vllm_prefix_cache_queries",
+        "vllm_prefix_cache_hit_rate",
         "vllm_request_prefill_time_seconds_p50",
         "vllm_request_prefill_time_seconds_p99",
         "vllm_inter_token_latency_seconds_p50",
@@ -677,6 +980,32 @@ def export_experiments(
         "vllm_time_to_first_token_seconds_p95",
         "vllm_time_to_first_token_seconds_p99",
         "vllm_generation_tokens_total_rate_per_s",
+        "vllm_num_requests_running_min",
+        "vllm_num_requests_running_max",
+        "vllm_num_requests_running_avg",
+        "vllm_num_requests_waiting_min",
+        "vllm_num_requests_waiting_max",
+        "vllm_num_requests_waiting_avg",
+        "vllm_num_requests_waiting_capacity_avg",
+        "vllm_num_requests_waiting_deferred_avg",
+        "vllm_request_queue_time_seconds_min",
+        "vllm_request_queue_time_seconds_avg",
+        "vllm_request_queue_time_seconds_max",
+        "vllm_e2e_request_latency_seconds_p50",
+        "vllm_e2e_request_latency_seconds_p95",
+        "vllm_e2e_request_latency_seconds_p99",
+        "vllm_request_max_num_generation_tokens_p50",
+        "vllm_request_max_num_generation_tokens_p95",
+        "vllm_request_params_max_tokens_p50",
+        "vllm_request_params_max_tokens_p95",
+        "vllm_request_params_n_p50",
+        "vllm_request_params_n_p95",
+        "vllm_kv_block_idle_before_evict_seconds_p50",
+        "vllm_kv_block_idle_before_evict_seconds_p95",
+        "vllm_kv_block_lifetime_seconds_p50",
+        "vllm_kv_block_lifetime_seconds_p95",
+        "vllm_kv_block_reuse_gap_seconds_p50",
+        "vllm_kv_block_reuse_gap_seconds_p95",
     ]
 
     with out_path.open("w", encoding="utf-8", newline="") as f:
