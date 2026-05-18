@@ -428,6 +428,36 @@ def _parse_openai_sse_usage(buffer: bytes) -> tuple[int, int]:
     return pt, ct
 
 
+def _parse_openai_sse_text_preview(buffer: bytes) -> str:
+    """
+    Best-effort extraction of the assistant text from an OpenAI-style
+    streaming SSE buffer. This walks data: lines, decodes JSON, and concatenates
+    delta.choices[].delta.content fields without truncation.
+    """
+    if not buffer:
+        return ""
+    text = buffer.decode(errors="replace")
+    out_parts: list[str] = []
+    for block in text.split("\n\n"):
+        for line in block.split("\n"):
+            s = line.strip()
+            if not s.startswith("data:"):
+                continue
+            data = s[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            for choice in obj.get("choices") or []:
+                delta = choice.get("delta") or {}
+                chunk = delta.get("content")
+                if isinstance(chunk, str) and chunk:
+                    out_parts.append(chunk)
+    return "".join(out_parts)
+
+
 def _smol_style_row(
     *,
     ttft_s: float,
@@ -463,6 +493,7 @@ def _build_metrics_log_row(
     completion_tokens: int,
     conversation_id: str | None = None,
     conversation_turn: str | None = None,
+    response_preview: str | None = None,
 ) -> dict[str, Any]:
     inter_ms = [d * 1000.0 for d in inter_chunk_delays_s]
     row: dict[str, Any] = {
@@ -494,6 +525,8 @@ def _build_metrics_log_row(
         row["conversation_id"] = conversation_id
     if conversation_turn is not None:
         row["conversation_turn"] = conversation_turn
+    if response_preview is not None:
+        row["response_preview"] = response_preview
     return row
 
 
@@ -833,7 +866,9 @@ async def _proxy(request: Request, upstream_path: str) -> Response:
             finally:
                 await resp.aclose()
                 dt = time.perf_counter() - t0
-                pt, ct = _parse_openai_sse_usage(bytes(buf))
+                buf_bytes = bytes(buf)
+                pt, ct = _parse_openai_sse_usage(buf_bytes)
+                response_preview = _parse_openai_sse_text_preview(buf_bytes)
                 ttft_s = first_ttft_s if first_ttft_s is not None else dt
                 for d in inter:
                     STREAM_INTER_CHUNK_SECONDS.labels(**lp).observe(d)
@@ -873,6 +908,7 @@ async def _proxy(request: Request, upstream_path: str) -> Response:
                         completion_tokens=ct,
                         conversation_id=conv_id,
                         conversation_turn=conv_turn,
+                        response_preview=response_preview or None,
                     ),
                 )
                 span.end()
@@ -919,6 +955,7 @@ async def _proxy(request: Request, upstream_path: str) -> Response:
         REQUESTS_TOTAL.labels(**lp).inc()
 
         pt, ct = 0, 0
+        payload: dict[str, Any] | None = None
         try:
             payload = json.loads(content)
             usage = payload.get("usage") or {}
@@ -930,6 +967,18 @@ async def _proxy(request: Request, upstream_path: str) -> Response:
             span.set_attribute("llm.completion_tokens", ct)
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
+
+        response_preview: str | None = None
+        if isinstance(payload, dict):
+            try:
+                choices = payload.get("choices") or []
+                if choices:
+                    msg = choices[0].get("message") or {}
+                    text = msg.get("content")
+                    if isinstance(text, str) and text:
+                        response_preview = text
+            except Exception:
+                response_preview = None
 
         ttft_s = dt
         tpot_avg_s = (dt / ct) if ct > 0 else 0.0
@@ -955,6 +1004,7 @@ async def _proxy(request: Request, upstream_path: str) -> Response:
                 completion_tokens=ct,
                 conversation_id=conv_id,
                 conversation_turn=conv_turn,
+                response_preview=response_preview,
             ),
         )
         if resp.status_code >= 400:
