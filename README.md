@@ -316,7 +316,7 @@ With Grafana open (time range **Last 1 hour** or **Last 15 minutes**):
 
 With vLLM, the gateway, nginx, Prometheus, and Grafana running (Steps **6–17**), you can drive a multi-turn benchmark using real ShareGPT conversations:
 
-1. From the repo root, run:
+1. From the repo root, run sequential sessions (one conversation at a time):
 
    ```bash
    cd fullstack-inferencing
@@ -325,6 +325,7 @@ With vLLM, the gateway, nginx, Prometheus, and Grafana running (Steps **6–17**
      --technique baseline \
      --num-conversations 20 \
      --mode static \
+     --max-sessions 1 \
      --sleep-between-turns 0.3
    ```
 
@@ -340,6 +341,33 @@ With vLLM, the gateway, nginx, Prometheus, and Grafana running (Steps **6–17**
 
    - The gateway writes one JSONL row per request under `logs/gateway/`.
    - When you use `sharegpt_turn_bench.py`, each row also includes `conversation_id` and `conversation_turn` fields derived from the request headers.
+
+4. To simulate multiple concurrent sessions:
+
+   ```bash
+   python sharegpt_turn_bench.py \
+     --technique baseline \
+     --num-conversations 50 \
+     --mode static \
+     --max-sessions 5
+   ```
+
+   - Up to 5 conversations will progress in parallel; each conversation's turns remain ordered within that session.
+   - To also cap total in-flight requests across all sessions, add e.g. `--max-inflight-requests 3`.
+
+5. Simple sanity check for concurrency:
+
+   ```bash
+   python sharegpt_turn_bench.py \
+     --technique baseline \
+     --num-conversations 3 \
+     --max-conversations 3 \
+     --max-turns-per-conv 2 \
+     --max-sessions 3
+   ```
+
+   - You should see log lines for sessions 0, 1, and 2 interleaved in the terminal.
+   - In Grafana / Prometheus, the three conversations should appear with overlapping timestamps while each session’s turns still appear in order.
 
 ---
 

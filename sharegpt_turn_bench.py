@@ -52,6 +52,7 @@ async def _send_turn_request(
     stream: bool,
     max_tokens: int,
     timeout_s: float,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "model": model,
@@ -70,7 +71,15 @@ async def _send_turn_request(
     started = time.perf_counter()
     try:
         if not stream:
-            resp = await client.post(url, json=payload, headers=headers, timeout=timeout_s)
+            ctx = (
+                semaphore
+                if semaphore is not None
+                else asyncio.dummy_context()  # type: ignore[attr-defined]
+            )
+            async with ctx:
+                resp = await client.post(
+                    url, json=payload, headers=headers, timeout=timeout_s
+                )
             resp.raise_for_status()
             elapsed = (time.perf_counter() - started) * 1000
             print(
@@ -79,26 +88,32 @@ async def _send_turn_request(
             )
             return
 
-        async with client.stream(
-            "POST",
-            url,
-            json=payload,
-            headers=headers,
-            timeout=timeout_s,
-        ) as response:
-            response.raise_for_status()
-            ttft_ms: float | None = None
-            tokens = 0
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data = line[6:].strip()
-                if data == "[DONE]":
-                    break
-                now = time.perf_counter()
-                if ttft_ms is None:
-                    ttft_ms = (now - started) * 1000
-                tokens += 1
+        ctx = (
+            semaphore
+            if semaphore is not None
+            else asyncio.dummy_context()  # type: ignore[attr-defined]
+        )
+        async with ctx:
+            async with client.stream(
+                "POST",
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout_s,
+            ) as response:
+                response.raise_for_status()
+                ttft_ms: float | None = None
+                tokens = 0
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    now = time.perf_counter()
+                    if ttft_ms is None:
+                        ttft_ms = (now - started) * 1000
+                    tokens += 1
 
         total_ms = (time.perf_counter() - started) * 1000
         note = (
@@ -115,6 +130,52 @@ async def _send_turn_request(
             f"ERROR after {total_ms:.1f} ms: {exc}",
             file=sys.stderr,
         )
+
+
+async def _run_session(
+    conv_id: int,
+    item: dict[str, Any],
+    *,
+    client: httpx.AsyncClient,
+    gateway_base: str,
+    model: str,
+    technique: str,
+    args: argparse.Namespace,
+    semaphore: asyncio.Semaphore | None,
+) -> None:
+    turns = iter_user_turns(
+        item["messages"],
+        mode=args.mode,
+        max_turns=args.max_turns_per_conv,
+    )
+    if not turns:
+        return
+
+    print(
+        f"[session {conv_id}] {len(turns)} user turns "
+        f"(estimated_input_tokens={item.get('estimated_input_tokens')})"
+    )
+
+    timeout_s = float(args.timeout_s)
+
+    for t in turns:
+        turn_index = int(t["turn_index"])
+        messages = list(t["messages"])
+        await _send_turn_request(
+            client,
+            gateway_base=gateway_base,
+            model=model,
+            technique=technique,
+            conversation_id=conv_id,
+            turn_index=turn_index,
+            messages=messages,
+            stream=args.stream,
+            max_tokens=args.max_tokens,
+            timeout_s=timeout_s,
+            semaphore=semaphore,
+        )
+        if args.sleep_between_turns > 0:
+            await asyncio.sleep(args.sleep_between_turns)
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -134,43 +195,46 @@ async def _run(args: argparse.Namespace) -> None:
     model = os.environ.get("MODEL_NAME", "texttinyllama")
     technique = args.technique
 
-    timeout_s = float(args.timeout_s)
+    # Apply max_conversations cap up front.
+    if args.max_conversations is not None:
+        pool = pool[: args.max_conversations]
+
+    max_sessions = args.max_sessions or 1
+    if max_sessions < 1:
+        max_sessions = 1
+
+    max_inflight = args.max_inflight_requests or 0
+    semaphore: asyncio.Semaphore | None
+    if max_inflight > 0:
+        semaphore = asyncio.Semaphore(max_inflight)
+    else:
+        semaphore = None
 
     async with httpx.AsyncClient() as client:
-        for conv_id, item in enumerate(pool):
-            if args.max_conversations is not None and conv_id >= args.max_conversations:
-                break
+        # Simple bounded-concurrency scheduler over conversation indices.
+        next_index = 0
+        total = len(pool)
 
-            turns = iter_user_turns(
-                item["messages"],
-                mode=args.mode,
-                max_turns=args.max_turns_per_conv,
-            )
-            if not turns:
-                continue
-
-            print(
-                f"Conversation {conv_id}: {len(turns)} user turns "
-                f"(estimated_input_tokens={item.get('estimated_input_tokens')})"
-            )
-
-            for t in turns:
-                turn_index = int(t["turn_index"])
-                messages = list(t["messages"])
-                await _send_turn_request(
-                    client,
+        async def worker(worker_id: int) -> None:
+            nonlocal next_index
+            while True:
+                if next_index >= total:
+                    return
+                conv_id = next_index
+                next_index += 1
+                await _run_session(
+                    conv_id,
+                    pool[conv_id],
+                    client=client,
                     gateway_base=gateway_base,
                     model=model,
                     technique=technique,
-                    conversation_id=conv_id,
-                    turn_index=turn_index,
-                    messages=messages,
-                    stream=args.stream,
-                    max_tokens=args.max_tokens,
-                    timeout_s=timeout_s,
+                    args=args,
+                    semaphore=semaphore,
                 )
-                if args.sleep_between_turns > 0:
-                    await asyncio.sleep(args.sleep_between_turns)
+
+        tasks = [asyncio.create_task(worker(i)) for i in range(max_sessions)]
+        await asyncio.gather(*tasks)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -234,6 +298,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.2,
         help="Seconds to sleep between turns (helps make Grafana graphs legible).",
+    )
+    parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=1,
+        help="Maximum number of conversations (sessions) to run concurrently.",
+    )
+    parser.add_argument(
+        "--max-inflight-requests",
+        type=int,
+        default=0,
+        help=(
+            "Optional hard cap on total in-flight requests across all sessions "
+            "(0 means unbounded per-session)."
+        ),
     )
     parser.add_argument(
         "--stream",
