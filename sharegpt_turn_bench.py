@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 import time
@@ -20,18 +21,12 @@ def _resolve_gateway_base() -> str:
     served = os.environ.get("MODEL_NAME", "texttinyllama")
     base = os.environ.get("GATEWAY_OPENAI_BASE") or os.environ.get("OPENAI_API_BASE")
     if not base:
-        use_lb = (
-            os.environ.get("GATEWAY_USE_LOAD_BALANCER", "true").strip().lower()
-            not in ("0", "false", "no", "off")
-        )
-        if use_lb:
-            host = os.environ.get("GATEWAY_LB_HOST", "127.0.0.1")
-            port = os.environ.get("GATEWAY_LB_PORT", "8780")
-            base = f"http://{host}:{port}/v1"
-        else:
-            host = os.environ.get("GATEWAY_HOST", "127.0.0.1")
-            port = os.environ.get("GATEWAY_PORT", "8765")
-            base = f"http://{host}:{port}/v1"
+        # For benchmarking, default to the gateway that exposes Prometheus
+        # metrics and JSONL timing logs, so runs show up in Grafana without
+        # needing any environment variables.
+        host = os.environ.get("GATEWAY_HOST", "127.0.0.1")
+        port = os.environ.get("GATEWAY_PORT", "8765")
+        base = f"http://{host}:{port}/v1"
     if not base.rstrip("/").endswith("/v1"):
         base = base.rstrip("/") + "/v1"
 
@@ -71,12 +66,12 @@ async def _send_turn_request(
     started = time.perf_counter()
     try:
         if not stream:
-            ctx = (
-                semaphore
-                if semaphore is not None
-                else asyncio.dummy_context()  # type: ignore[attr-defined]
-            )
-            async with ctx:
+            if semaphore is not None:
+                async with semaphore:
+                    resp = await client.post(
+                        url, json=payload, headers=headers, timeout=timeout_s
+                    )
+            else:
                 resp = await client.post(
                     url, json=payload, headers=headers, timeout=timeout_s
                 )
@@ -88,12 +83,29 @@ async def _send_turn_request(
             )
             return
 
-        ctx = (
-            semaphore
-            if semaphore is not None
-            else asyncio.dummy_context()  # type: ignore[attr-defined]
-        )
-        async with ctx:
+        if semaphore is not None:
+            async with semaphore:
+                async with client.stream(
+                    "POST",
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout_s,
+                ) as response:
+                    response.raise_for_status()
+                    ttft_ms: float | None = None
+                    tokens = 0
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data = line[6:].strip()
+                        if data == "[DONE]":
+                            break
+                        now = time.perf_counter()
+                        if ttft_ms is None:
+                            ttft_ms = (now - started) * 1000
+                        tokens += 1
+        else:
             async with client.stream(
                 "POST",
                 url,
@@ -125,9 +137,15 @@ async def _send_turn_request(
         print(f"[conv {conversation_id} turn {turn_index}] {note}")
     except Exception as exc:
         total_ms = (time.perf_counter() - started) * 1000
+        try:
+            last_msg = messages[-1] if messages else None
+            debug_messages = json.dumps(last_msg, ensure_ascii=False, indent=2)
+        except TypeError:
+            debug_messages = repr(messages[-1] if messages else None)
         print(
             f"[conv {conversation_id} turn {turn_index}] "
-            f"ERROR after {total_ms:.1f} ms: {exc}",
+            f"ERROR after {total_ms:.1f} ms: {exc}\n"
+            f"Raw messages payload:\n{debug_messages}",
             file=sys.stderr,
         )
 
@@ -161,12 +179,13 @@ async def _run_session(
     for t in turns:
         turn_index = int(t["turn_index"])
         messages = list(t["messages"])
+        conversation_identifier: str | int = item.get("id", conv_id)
         await _send_turn_request(
             client,
             gateway_base=gateway_base,
             model=model,
             technique=technique,
-            conversation_id=conv_id,
+            conversation_id=conversation_identifier,
             turn_index=turn_index,
             messages=messages,
             stream=args.stream,

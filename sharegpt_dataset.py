@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
@@ -7,15 +8,25 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-SHAREGPT_URL = (
+SHAREGPT_URL = os.environ.get(
+    "SHAREGPT_URL",
     "https://huggingface.co/datasets/anon8231489123/"
-    "ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V4.3_unfiltered_cleaned_split.json"
+    "ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json",
 )
 
 DEFAULT_CACHE_DIR = Path(
     os.environ.get("SHAREGPT_CACHE_DIR", Path.home() / ".cache" / "llm_bench")
 )
 DEFAULT_CACHE_PATH = DEFAULT_CACHE_DIR / "sharegpt.json"
+
+
+def _download_sharegpt(url: str, path: Path) -> None:
+    """
+    Download the ShareGPT JSON from `url` into `path`.
+    """
+    print(f"Downloading ShareGPT dataset from {url} to {path} …")
+    urllib.request.urlretrieve(url, path)
+    print("Download complete.\n")
 
 
 def _ensure_sharegpt(path: Path) -> Path:
@@ -27,9 +38,7 @@ def _ensure_sharegpt(path: Path) -> Path:
         return path
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading ShareGPT dataset from {SHAREGPT_URL} to {path} …")
-    urllib.request.urlretrieve(SHAREGPT_URL, path)
-    print("Download complete.\n")
+    _download_sharegpt(SHAREGPT_URL, path)
     return path
 
 
@@ -93,6 +102,7 @@ def load_sharegpt(
 
         pool.append(
             {
+                "id": entry.get("id"),
                 "messages": messages,
                 "estimated_input_tokens": est,
             }
@@ -116,6 +126,59 @@ def load_sharegpt(
         f"(input tokens: {min_input_tokens}–{max_input_tokens})."
     )
     return pool
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Download the ShareGPT dataset JSON to a local path. "
+            "By default this writes to ~/.cache/llm_bench/sharegpt.json."
+        )
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=str(DEFAULT_CACHE_PATH),
+        help="Output path for sharegpt.json "
+        f"(default: {DEFAULT_CACHE_PATH}).",
+    )
+    parser.add_argument(
+        "--url",
+        type=str,
+        default=SHAREGPT_URL,
+        help=(
+            "URL to download the ShareGPT JSON from "
+            "(default: value of SHAREGPT_URL or built-in default)."
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download even if the output file already exists.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """
+    Simple CLI entrypoint so you can run:
+
+        python sharegpt_dataset.py [--output PATH] [--url URL] [--force]
+    """
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    out_path = Path(args.output).expanduser()
+    if out_path.is_file() and not args.force:
+        print(f"ShareGPT dataset already exists at {out_path}. Use --force to re-download.")
+        return
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _download_sharegpt(args.url, out_path)
+
+
+if __name__ == "__main__":
+    main()
 
 
 def iter_user_turns(
