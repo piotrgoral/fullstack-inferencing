@@ -1,8 +1,8 @@
 """
 python scripts/export_experiments.py \
   --log-path logs/gateway/gateway_metrics_2026-05-18.jsonl \
-  --technique q35_4b_base-conv-num-conv-64-max-turns-16-max-sessions-16-max-tokens-1024 \
-  --output-csv data/experiments_q35_4b_base-conv-num-conv-64-max-turns-16-max-sessions-16-max-tokens-1024.csv
+  --technique q35_4b_dflash-8-num-conv-64-max-turns-16-max-sessions-8-max-tokens-1024 \
+  --output-csv data/experiments_q35_4b_dflash-8-num-conv-64-max-turns-16-max-sessions-8-max-tokens-1024.csv
 """
 
 from __future__ import annotations
@@ -814,6 +814,85 @@ def export_experiments(
         )
         total_vllm_generation_tokens = gen_vals[0][1] if gen_vals else 0.0
 
+        # Speculative decoding metrics (if vLLM was started with speculative decoding).
+        # New-style OpenMetrics names (vLLM 0.13+):
+        spec_accepted_expr = (
+            f"sum(increase(vllm:spec_decode_num_accepted_tokens_total[{window_spec}]))"
+        )
+        spec_draft_expr = (
+            f"sum(increase(vllm:spec_decode_num_draft_tokens_total[{window_spec}]))"
+        )
+        spec_accepted_vals = prom_query_instant(
+            prometheus_url,
+            spec_accepted_expr,
+            end_ts,
+        )
+        spec_draft_vals = prom_query_instant(
+            prometheus_url,
+            spec_draft_expr,
+            end_ts,
+        )
+
+        # Fallback to legacy vllm_ names if vllm: series are missing.
+        if not spec_accepted_vals and not spec_draft_vals:
+            spec_accepted_expr_legacy = (
+                f"sum(increase(vllm_spec_decode_num_accepted_tokens_total[{window_spec}]))"
+            )
+            spec_draft_expr_legacy = (
+                f"sum(increase(vllm_spec_decode_num_draft_tokens_total[{window_spec}]))"
+            )
+            spec_accepted_vals = prom_query_instant(
+                prometheus_url,
+                spec_accepted_expr_legacy,
+                end_ts,
+            )
+            spec_draft_vals = prom_query_instant(
+                prometheus_url,
+                spec_draft_expr_legacy,
+                end_ts,
+            )
+
+        vllm_spec_decode_accepted_tokens_total_increase = (
+            spec_accepted_vals[0][1] if spec_accepted_vals else 0.0
+        )
+        vllm_spec_decode_draft_tokens_total_increase = (
+            spec_draft_vals[0][1] if spec_draft_vals else 0.0
+        )
+        vllm_spec_decode_accepted_tokens_rate_per_s = (
+            vllm_spec_decode_accepted_tokens_total_increase / span_s
+            if span_s > 0
+            else 0.0
+        )
+        vllm_spec_decode_draft_tokens_rate_per_s = (
+            vllm_spec_decode_draft_tokens_total_increase / span_s
+            if span_s > 0
+            else 0.0
+        )
+        vllm_spec_decode_accepted_over_draft_rate = (
+            vllm_spec_decode_accepted_tokens_total_increase
+            / vllm_spec_decode_draft_tokens_total_increase
+            if vllm_spec_decode_draft_tokens_total_increase > 0
+            else None
+        )
+
+        # Draft acceptance rate gauge (if exported).
+        spec_acceptance_gauge_expr = "vllm:spec_decode_draft_acceptance_rate"
+        spec_acceptance_vals = prom_query_instant(
+            prometheus_url,
+            spec_acceptance_gauge_expr,
+            end_ts,
+        )
+        if not spec_acceptance_vals:
+            spec_acceptance_gauge_expr_legacy = "vllm_spec_decode_draft_acceptance_rate"
+            spec_acceptance_vals = prom_query_instant(
+                prometheus_url,
+                spec_acceptance_gauge_expr_legacy,
+                end_ts,
+            )
+        vllm_spec_decode_draft_acceptance_rate = (
+            spec_acceptance_vals[0][1] if spec_acceptance_vals else None
+        )
+
         row: Dict[str, Any] = {
             "technique": tech,
             "server_profiles": ",".join(window.server_profiles),
@@ -934,6 +1013,13 @@ def export_experiments(
             "vllm_kv_block_reuse_gap_seconds_p95": kv_hist_metrics.get(
                 "vllm_kv_block_reuse_gap_seconds_p95"
             ),
+            # vLLM speculative decoding metrics:
+            "vllm_spec_decode_accepted_tokens_total_increase": vllm_spec_decode_accepted_tokens_total_increase,
+            "vllm_spec_decode_draft_tokens_total_increase": vllm_spec_decode_draft_tokens_total_increase,
+            "vllm_spec_decode_accepted_tokens_rate_per_s": vllm_spec_decode_accepted_tokens_rate_per_s,
+            "vllm_spec_decode_draft_tokens_rate_per_s": vllm_spec_decode_draft_tokens_rate_per_s,
+            "vllm_spec_decode_accepted_over_draft_rate": vllm_spec_decode_accepted_over_draft_rate,
+            "vllm_spec_decode_draft_acceptance_rate": vllm_spec_decode_draft_acceptance_rate,
         }
         row.update(latency_metrics)
         rows.append(row)
@@ -1006,6 +1092,13 @@ def export_experiments(
         "vllm_kv_block_lifetime_seconds_p95",
         "vllm_kv_block_reuse_gap_seconds_p50",
         "vllm_kv_block_reuse_gap_seconds_p95",
+        # vLLM speculative decoding metrics:
+        "vllm_spec_decode_accepted_tokens_total_increase",
+        "vllm_spec_decode_draft_tokens_total_increase",
+        "vllm_spec_decode_accepted_tokens_rate_per_s",
+        "vllm_spec_decode_draft_tokens_rate_per_s",
+        "vllm_spec_decode_accepted_over_draft_rate",
+        "vllm_spec_decode_draft_acceptance_rate",
     ]
 
     with out_path.open("w", encoding="utf-8", newline="") as f:
