@@ -1,7 +1,7 @@
 """Focused Part B figures for submission.md.
 
     python scripts/plot_submission_figures.py \
-      --input-csv data/experiments_with_completion_stats.csv \
+      --input-csv results/experiments_with_completion_stats.csv \
       --output-dir figures/submission
 
 Produces five figures, each tied to an insight in submission.md:
@@ -57,9 +57,17 @@ def _arms_for(df: pd.DataFrame, model: str) -> list[str]:
     return [m for m in MODE_ORDER if m in present]
 
 
-def load(input_csv: Path) -> pd.DataFrame:
+# The committed CSV's cost column was computed at this GPU hourly rate.
+CSV_COST_BASIS_HOURLY_USD = 2.5
+
+
+def load(input_csv: Path, gpu_hourly_usd: float = CSV_COST_BASIS_HOURLY_USD) -> pd.DataFrame:
     df = pd.read_csv(input_csv)
-    df["cost_per_1M_usd"] = df["llm_gateway_cost_per_completion_token_usd"] * 1e6
+    # Cost per token scales linearly with the GPU hourly rate, so rescale the
+    # CSV's $2.50-basis cost to the requested rate (e.g. A10 @ $1.29/hr).
+    scale = gpu_hourly_usd / CSV_COST_BASIS_HOURLY_USD
+    df["cost_per_1M_usd"] = df["llm_gateway_cost_per_completion_token_usd"] * 1e6 * scale
+    df.attrs["gpu_hourly_usd"] = gpu_hourly_usd
     return df
 
 
@@ -194,8 +202,9 @@ def fig_cost_per_token(df: pd.DataFrame, out: Path) -> None:
                label=MODEL_LABEL[model],
                hatch="//" if model == "q3_4b" else "")
     ax.set_xticks(list(x)); ax.set_xticklabels(all_arms, rotation=30, ha="right")
+    rate = df.attrs.get("gpu_hourly_usd", CSV_COST_BASIS_HOURLY_USD)
     ax.set_ylabel("USD per 1M completion tokens")
-    ax.set_title("F5 — Cost per completion token by arm")
+    ax.set_title(f"F5 — Cost per completion token by arm (GPU @ ${rate:.2f}/hr)")
     ax.legend(); ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out, dpi=130)
@@ -205,11 +214,13 @@ def fig_cost_per_token(df: pd.DataFrame, out: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input-csv", type=Path,
-                    default=Path("data/experiments_with_completion_stats.csv"))
+                    default=Path("results/experiments_with_completion_stats.csv"))
     ap.add_argument("--output-dir", type=Path, default=Path("figures/submission"))
+    ap.add_argument("--gpu-hourly", type=float, default=1.29,
+                    help="GPU hourly USD rate for cost figure (CSV basis is $2.50)")
     args = ap.parse_args()
 
-    df = load(args.input_csv)
+    df = load(args.input_csv, args.gpu_hourly)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     fig_throughput_by_arm(df, args.output_dir / "f1_throughput_by_arm.png")
